@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# ==============================================================================
-#  AmneziaWG + udp2raw (FakeTCP) Anti-Filter Tunnel v6.5 (Multi-Iran Enterprise)
-#  - Multi-Iran Hub: Connect 1 to 5 Iran Servers to 1 Foreign Server seamlessly
-#  - 100% Randomized Ports for AmneziaWG & Local Loopback (No 51820 anywhere)
-#  - Self-Healing Watchdog (45s) + Nightly Session Rotation (04:30 AM)
-#  - Heavy Kernel, Conntrack, Socket Buffer & NIC Queue Tuning (txqueuelen 10000)
-#  - Anti-Abuse & Anti-Bad-SNI Packet Filter (Blocks SMTP Spam, Torrent & Bad SNIs)
-#  - Auto Port-Conflict Check & Safe All-Ports Forwarding
-# ==============================================================================
 
 set -uo pipefail
 
