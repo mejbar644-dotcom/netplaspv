@@ -35,7 +35,7 @@ banner() {
   clear 2>/dev/null || true
   echo "${CYAN}${BOLD}"
   echo "=================================================================="
-  echo "   AmneziaWG + udp2raw (FakeTCP) Tunnel v6.6 [1-to-5 Multi-Iran]"
+  echo "   AmneziaWG + udp2raw (FakeTCP) Tunnel v6.7 [1-to-5 Multi-Iran]"
   echo "   Random Ports | Watchdog | Nightly Rotate | Anti-SNI | 1-2 TB/d"
   echo "=================================================================="
   echo "${RESET}"
@@ -110,13 +110,18 @@ filter_free_pool() {
   ( IFS=,; echo "${out[*]:-}" )
 }
 
-# انتخاب پورت روز از روی استخر پورت و کلید مشترک؛ روز در ساعت ۴:۳۰ تهران (۰۱:۰۰ UTC) عوض می‌شود
+# شماره روز چرخش؛ ۱۰ ثانیه قبل از ۴:۳۰ تهران عوض می‌شود تا اجرای ساعت ۴:۳۰ همیشه روز جدید را ببیند
+rot_day() {
+  echo $(( ( $(date +%s) - 3590 ) / 86400 ))
+}
+
+# انتخاب پورت روز از روی استخر پورت و کلید مشترک
 rot_pick_port() {
   local pool=$1 secret=$2 off=${3:-0} arr n eday h0
   IFS=',' read -ra arr <<< "$pool"
   n=${#arr[@]}
   (( n > 0 )) || return 1
-  eday=$(( ( $(date +%s) - 3600 ) / 86400 + off ))
+  eday=$(( $(rot_day) + off ))
   h0=$(( 16#$(printf '%s' "$secret" | sha256sum | cut -c1-8) ))
   echo "${arr[$(( (h0 + eday) % n ))]}"
 }
@@ -135,8 +140,22 @@ svc_secret() {
 
 write_rotate_conf() {
   mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
-  { echo "POOL=$1"; echo "SECRET=$2"; } > "$ROT_CONF"
+  { echo "POOL=$1"; echo "SECRET=$2"; echo "APPLIED=$(rot_day)"; } > "$ROT_CONF"
   chmod 600 "$ROT_CONF"
+}
+
+multiport_chunks() {
+  local tok slots cur="" n=0 arr
+  IFS=',' read -ra arr <<< "$1"
+  for tok in "${arr[@]}"; do
+    [[ -n "$tok" ]] || continue
+    slots=1; [[ "$tok" == *:* ]] && slots=2
+    if (( n + slots > 15 )); then echo "$cur"; cur=""; n=0; fi
+    cur+="${cur:+,}${tok}"
+    n=$(( n + slots ))
+  done
+  [[ -n "$cur" ]] && echo "$cur"
+  return 0
 }
 
 valid_port() {
@@ -168,6 +187,25 @@ open_ufw_tcp() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "$1/tcp" >/dev/null 2>&1 && ok "ufw: TCP port $1 allowed."
   fi
+}
+
+close_ufw_tcp() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw --force delete allow "$1/tcp" >/dev/null 2>&1 && ok "ufw: old TCP port $1 closed."
+  fi
+}
+
+refresh_meta_token() {
+  [[ "$(meta_get ROLE)" == "foreign" ]] || return 0
+  (
+    local t cur nt
+    t=$(meta_get TOKEN); [[ -n "$t" ]] || exit 0
+    decode_token "$t"
+    cur=$(cur_port_from_service); [[ -n "$cur" ]] && RAW_PORT="$cur"
+    ROT_POOL=$(sed -n 's/^POOL=//p' "$ROT_CONF" 2>/dev/null | head -n1)
+    nt=$(encode_token)
+    sed -i "s|^RAW_PORT=.*|RAW_PORT=${RAW_PORT}|; s|^TOKEN=.*|TOKEN=${nt}|" "$META"
+  )
 }
 
 apply_awg_live() {
@@ -332,6 +370,7 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_udp_timeout = 30
 net.netfilter.nf_conntrack_udp_timeout_stream = 120
+net.netfilter.nf_conntrack_acct = 1
 
 # File Descriptors
 fs.file-max = 2097152
@@ -529,12 +568,14 @@ SVC="/etc/systemd/system/udp2raw.service"
 META="/etc/amnezia/amneziawg/awg0.meta"
 
 EOF
-    declare -f rot_pick_port
+    declare -f rot_day rot_pick_port
     cat <<'EOF'
 
 conf_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n1; }
 POOL=$(conf_get POOL)
 SECRET=$(conf_get SECRET)
+APPLIED=$(conf_get APPLIED)
+TODAY=$(rot_day)
 
 is_foreign() { grep -q ' -s ' "$SVC" 2>/dev/null; }
 cur_port() {
@@ -544,13 +585,18 @@ cur_port() {
     grep -oE -- '-r [0-9.]+:[0-9]+' "$SVC" | grep -oE '[0-9]+$'
   fi
 }
+old_in_use() {
+  ss -tlnp 2>/dev/null | awk -v p="$1" 'NR>1 {n=split($4,a,":"); if (a[n]==p) print}' | grep -qv 'udp2raw'
+}
+ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; }
 
 MODE="${1:-sync}"
 
 if [[ "$MODE" == "--status" ]]; then
   if [[ -n "$POOL" && -n "$SECRET" ]]; then
     echo "Port rotation: ON | pool: ${POOL}"
-    echo "Today's port: $(rot_pick_port "$POOL" "$SECRET" 0) | current port: $(cur_port) | next at 04:30 Tehran: $(rot_pick_port "$POOL" "$SECRET" 1)"
+    echo "Current port: $(cur_port) | next change at 04:30 Tehran -> $(rot_pick_port "$POOL" "$SECRET" 1)"
+    [[ "$APPLIED" != "$TODAY" ]] && echo "Pending: port will switch to $(rot_pick_port "$POOL" "$SECRET" 0) at the next sync"
   else
     echo "Port rotation: OFF"
   fi
@@ -562,15 +608,23 @@ if [[ -z "$POOL" || -z "$SECRET" ]]; then
   exit 0
 fi
 
-NEW=$(rot_pick_port "$POOL" "$SECRET" 0) || exit 1
 CUR=$(cur_port)
+
+# امروز قبلاً انجام شده؛ فقط در حالت شبانه سشن تازه می‌شود
+if [[ "$APPLIED" == "$TODAY" ]]; then
+  if [[ "$MODE" == "--nightly" ]]; then
+    systemctl restart udp2raw.service
+    logger -t awg-port-rotate "Session refreshed on port ${CUR}"
+  fi
+  exit 0
+fi
+
+NEW=$(rot_pick_port "$POOL" "$SECRET" 0) || exit 1
 
 if [[ "$NEW" != "$CUR" ]]; then
   if is_foreign; then
     sed -i -E "s#(-l 0\.0\.0\.0:)[0-9]+#\1${NEW}#" "$SVC"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-      ufw allow "${NEW}/tcp" >/dev/null 2>&1
-    fi
+    ufw_active && ufw allow "${NEW}/tcp" >/dev/null 2>&1
   else
     sed -i -E "s#(-r [0-9.]+:)[0-9]+#\1${NEW}#" "$SVC"
   fi
@@ -578,9 +632,18 @@ if [[ "$NEW" != "$CUR" ]]; then
   systemctl daemon-reload
   systemctl restart udp2raw.service
   logger -t awg-port-rotate "FakeTCP port changed ${CUR} -> ${NEW}"
+  if is_foreign && ufw_active && ! old_in_use "$CUR"; then
+    ufw --force delete allow "${CUR}/tcp" >/dev/null 2>&1
+  fi
 elif [[ "$MODE" == "--nightly" ]]; then
   systemctl restart udp2raw.service
   logger -t awg-port-rotate "Session refreshed on port ${CUR}"
+fi
+
+if grep -q '^APPLIED=' "$CONF"; then
+  sed -i "s/^APPLIED=.*/APPLIED=${TODAY}/" "$CONF"
+else
+  echo "APPLIED=${TODAY}" >> "$CONF"
 fi
 EOF
   } > "$ROT_BIN"
@@ -592,6 +655,9 @@ write_rotate_timer() {
   local when="${1:-04:30}"
   [[ "$when" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "Invalid time. Use HH:MM."
   write_rotate_script
+  if [[ -f "$ROT_CONF" ]] && ! grep -q '^APPLIED=' "$ROT_CONF"; then
+    echo "APPLIED=$(rot_day)" >> "$ROT_CONF"
+  fi
   local cal="*-*-* ${when}:00 Asia/Tehran"
 
   if ! systemd-analyze calendar "$cal" >/dev/null 2>&1; then
@@ -655,18 +721,35 @@ write_iran_cfg() {
   local NIC=$1
   mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
 
-  local DNAT_RULES=""
+  local DNAT_RULES="" chunk
   if [[ "$FWD_MODE" == "2" ]]; then
-    DNAT_RULES="PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport --dports ${CUSTOM_PORTS} -j DNAT --to-destination ${FR_ADDR}
-PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport --dports ${CUSTOM_PORTS} -j DNAT --to-destination ${FR_ADDR}"
+    while read -r chunk; do
+      [[ -n "$chunk" ]] || continue
+      DNAT_RULES+="PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport --dports ${chunk} -j DNAT --to-destination ${FR_ADDR}"$'\n'
+      DNAT_RULES+="PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport --dports ${chunk} -j DNAT --to-destination ${FR_ADDR}"$'\n'
+    done < <(multiport_chunks "$CUSTOM_PORTS")
   else
-    DNAT_RULES="PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport ! --dports ${KEEP_TCP_PORTS},25,465,587 -j DNAT --to-destination ${FR_ADDR}
-PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport ! --dports ${LOCAL_UDP_PORT},${LISTEN_PORT},53 -j DNAT --to-destination ${FR_ADDR}"
+    while read -r chunk; do
+      [[ -n "$chunk" ]] || continue
+      DNAT_RULES+="PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport --dports ${chunk} -j RETURN"$'\n'
+    done < <(multiport_chunks "${KEEP_TCP_PORTS},25,465,587")
+    DNAT_RULES+="PostUp = iptables -t nat -A AWG_DNAT -p tcp -j DNAT --to-destination ${FR_ADDR}"$'\n'
+    while read -r chunk; do
+      [[ -n "$chunk" ]] || continue
+      DNAT_RULES+="PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport --dports ${chunk} -j RETURN"$'\n'
+    done < <(multiport_chunks "${LOCAL_UDP_PORT},${LISTEN_PORT},53")
+    DNAT_RULES+="PostUp = iptables -t nat -A AWG_DNAT -p udp -j DNAT --to-destination ${FR_ADDR}"$'\n'
   fi
+
+  local GUARD_RULES="" str
+  for str in "youtube.com" "googlevideo.com" "pornhub.com" "BitTorrent protocol"; do
+    GUARD_RULES+="PostUp = iptables -A AWG_GUARD -p tcp -m connbytes --connbytes 1:10 --connbytes-mode packets --connbytes-dir original -m string --algo bm --string \"${str}\" -j DROP 2>/dev/null || iptables -A AWG_GUARD -m string --algo bm --string \"${str}\" -j DROP"$'\n'
+  done
 
   { common_iface_block
     cat <<EOF
 PostUp = sysctl -qw net.ipv4.ip_forward=1
+PostUp = sysctl -qw net.netfilter.nf_conntrack_acct=1 2>/dev/null || true
 PostUp = ip link set dev %i txqueuelen 10000 2>/dev/null || true
 PostUp = ip link set dev ${NIC} txqueuelen 10000 2>/dev/null || true
 PostUp = iptables -t nat -N AWG_DNAT 2>/dev/null || true
@@ -687,11 +770,7 @@ ${DNAT_RULES}
 PostUp = iptables -N AWG_GUARD 2>/dev/null || true
 PostUp = iptables -F AWG_GUARD
 PostUp = iptables -A AWG_GUARD -p tcp -m multiport --dports 25,465,587 -j DROP
-PostUp = iptables -A AWG_GUARD -m string --algo bm --string "youtube.com" -j DROP
-PostUp = iptables -A AWG_GUARD -m string --algo bm --string "googlevideo.com" -j DROP
-PostUp = iptables -A AWG_GUARD -m string --algo bm --string "pornhub.com" -j DROP
-PostUp = iptables -A AWG_GUARD -m string --algo bm --string "BitTorrent protocol" -j DROP
-PostUp = iptables -C FORWARD -i ${NIC} -o %i -j AWG_GUARD 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j AWG_GUARD
+${GUARD_RULES}PostUp = iptables -C FORWARD -i ${NIC} -o %i -j AWG_GUARD 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j AWG_GUARD
 
 # NAT و MSS Clamping
 PostUp = iptables -t nat -C POSTROUTING -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
@@ -976,6 +1055,14 @@ action_health() {
   echo "Server time: $(date '+%F %T %Z') | Tehran time: $(TZ=Asia/Tehran date '+%F %T')"
   systemctl list-timers awg-nightly-rotate.timer --no-pager 2>/dev/null | head -n 3
   [[ -x "$ROT_BIN" ]] && "$ROT_BIN" --status
+  if [[ "$role" == "foreign" && -f "$ROT_CONF" ]]; then
+    local pp p parr
+    pp=$(sed -n 's/^POOL=//p' "$ROT_CONF" | head -n1)
+    IFS=',' read -ra parr <<< "$pp"
+    for p in "${parr[@]}"; do
+      port_used_by_other "$p" && warn "Pool port ${p} is used by another service. Remove it from the pool on ALL servers (option 10)."
+    done
+  fi
   echo ""
   echo "${CYAN}${BOLD}=== 4. Conntrack Usage ===${RESET}"
   CT_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "N/A")
@@ -1005,6 +1092,7 @@ action_rotate() {
   read -rp "New FakeTCP port (use the same value on foreign and all Iran nodes): " NEW_PORT
   valid_port "$NEW_PORT" || die "Invalid port."
   [[ -f "$ROT_CONF" ]] && warn "Daily port rotation is enabled. This port is replaced at the next 04:30 Tehran."
+  OLD_PORT=$(cur_port_from_service)
 
   if grep -q ' -s ' /etc/systemd/system/udp2raw.service; then
     sed -i -E "s#(-l 0\.0\.0\.0:)[0-9]+#\1${NEW_PORT}#" /etc/systemd/system/udp2raw.service
@@ -1022,19 +1110,19 @@ action_rotate() {
 
   systemctl daemon-reload
   systemctl restart udp2raw.service
+  if grep -q ' -s ' "$SVC" && [[ -n "$OLD_PORT" && "$OLD_PORT" != "$NEW_PORT" ]] && ! port_used_by_other "$OLD_PORT"; then
+    close_ufw_tcp "$OLD_PORT"
+  fi
   ok "FakeTCP port rotated to ${NEW_PORT} and session refreshed."
 }
 
 action_show_token() {
   [[ "$(meta_get ROLE)" == "foreign" ]] || die "This option must be run on the foreign server."
+  refresh_meta_token
   local t; t=$(meta_get TOKEN)
   [[ -n "$t" ]] || die "Token not found."
-  decode_token "$t"
-  local cur; cur=$(cur_port_from_service)
-  [[ -n "$cur" ]] && RAW_PORT="$cur"
-  ROT_POOL=$(sed -n 's/^POOL=//p' "$ROT_CONF" 2>/dev/null | head -n1)
-  echo "${YELLOW}${BOLD}MASTER TOKEN (current FakeTCP port: ${RAW_PORT}):${RESET}"
-  echo "${CYAN}$(encode_token)${RESET}"
+  echo "${YELLOW}${BOLD}MASTER TOKEN (current FakeTCP port: $(meta_get RAW_PORT)):${RESET}"
+  echo "${CYAN}${t}${RESET}"
 }
 
 action_remove_node() {
@@ -1091,15 +1179,18 @@ action_port_rotation() {
       if [[ "$role" == "iran" && -f /usr/local/bin/awg-watchdog.sh ]]; then
         write_watchdog_script
       fi
+      [[ "$role" == "foreign" ]] && refresh_meta_token
       ok "Daily port rotation enabled."
       info "Use this exact pool on every server: ${pool}"
-      warn "Enable it on the foreign server and ALL Iran nodes before the next 04:30 Tehran."
+      info "The current port does not change now. The first change happens at the next 04:30 Tehran."
+      warn "Enable it on the foreign server and ALL Iran nodes before then."
       "$ROT_BIN" --status
       ;;
     2)
       rm -f "$ROT_CONF"
       if [[ "$role" == "foreign" ]]; then
         systemctl disable --now awg-nightly-rotate.timer >/dev/null 2>&1 || true
+        refresh_meta_token
       fi
       ok "Port rotation disabled. The current port stays; keep all servers on the same port."
       ;;
@@ -1107,8 +1198,62 @@ action_port_rotation() {
   esac
 }
 
+action_light_guard() {
+  [[ "$(meta_get ROLE)" == "iran" ]] || die "This option must be run on an Iran server."
+  [[ -f "$CFG" ]] || die "No config at ${CFG}."
+  if grep -q 'connbytes' "$CFG"; then
+    info "Lighter Anti-SNI rules are already applied."
+    return 0
+  fi
+  iptables -m connbytes --help >/dev/null 2>&1 || die "This kernel has no connbytes module."
+  warn "The tunnel restarts for a few seconds."
+  confirm "Continue?" || { info "Cancelled."; return 0; }
+
+  cp -a "$CFG" "${CFG}.bak"
+  sed -i -E 's#^PostUp = iptables -A AWG_GUARD -m string (.*) -j DROP$#PostUp = iptables -A AWG_GUARD -p tcp -m connbytes --connbytes 1:10 --connbytes-mode packets --connbytes-dir original -m string \1 -j DROP 2>/dev/null || iptables -A AWG_GUARD -m string \1 -j DROP#' "$CFG"
+
+  grep -q 'nf_conntrack_acct' /etc/sysctl.d/99-awg-optimizer.conf 2>/dev/null \
+    || echo "net.netfilter.nf_conntrack_acct = 1" >> /etc/sysctl.d/99-awg-optimizer.conf
+  sysctl -qw net.netfilter.nf_conntrack_acct=1 2>/dev/null || true
+
+  LISTEN_PORT=$(meta_get LISTEN_PORT)
+  bring_up
+  ok "Lighter Anti-SNI rules applied (only the first 10 packets of each connection are scanned)."
+}
+
+action_udp2raw_mode() {
+  [[ -f "$SVC" ]] || die "udp2raw service not found. Run the setup first."
+  local cc ca
+  cc=$(grep -oE -- '--cipher-mode [a-z0-9]+' "$SVC" | awk '{print $2}')
+  ca=$(grep -oE -- '--auth-mode [a-z0-9]+' "$SVC" | awk '{print $2}')
+  echo "Current: cipher=${cc:-?} auth=${ca:-?}"
+  echo
+  echo "  1 - aes128cbc + hmac_sha1 (default)"
+  echo "  2 - xor + simple (lighter on CPU, weaker)"
+  echo "  0 - Back"
+  read -rp "Choice [0]: " mc
+
+  local nc na
+  case "${mc:-0}" in
+    1) nc="aes128cbc"; na="hmac_sha1" ;;
+    2) nc="xor";       na="simple" ;;
+    *) return 0 ;;
+  esac
+
+  warn "Cipher and auth mode must be identical on the foreign server and ALL Iran nodes. The tunnel stays down until all of them match."
+  confirm "Continue?" || { info "Cancelled."; return 0; }
+
+  sed -i -E "s/--cipher-mode [a-z0-9]+/--cipher-mode ${nc}/; s/--auth-mode [a-z0-9]+/--auth-mode ${na}/" "$SVC"
+  systemctl daemon-reload
+  systemctl restart udp2raw.service
+  ok "udp2raw mode set to ${nc} + ${na}. Repeat on every other server."
+}
+
 action_uninstall() {
   confirm "Remove all tunnel services, rules and configs?" || { info "Cancelled."; return 0; }
+  local was_foreign=0 last_port=""
+  grep -q ' -s ' "$SVC" 2>/dev/null && was_foreign=1
+  last_port=$(cur_port_from_service)
   systemctl disable --now awg-watchdog.timer awg-watchdog.service >/dev/null 2>&1 || true
   systemctl disable --now awg-nightly-rotate.timer awg-nightly-rotate.service >/dev/null 2>&1 || true
   systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
@@ -1120,6 +1265,9 @@ action_uninstall() {
          /etc/systemd/system/awg-nightly-rotate.service /etc/systemd/system/awg-nightly-rotate.timer \
          /etc/security/limits.d/99-awg.conf "/etc/systemd/system/awg-quick@${IFACE}.service.d" "$ROT_BIN"
   systemctl daemon-reload
+  if [[ $was_foreign -eq 1 && -n "$last_port" ]] && ! port_used_by_other "$last_port"; then
+    close_ufw_tcp "$last_port"
+  fi
   ok "Uninstalled and cleaned up all services, rules and configs."
 }
 
@@ -1136,6 +1284,8 @@ Select an option:
   8 - FOREIGN: remove Iran node
   9 - Set nightly rotation time
   10 - Daily web-port rotation
+  11 - IRAN: lighter Anti-SNI rules
+  12 - udp2raw cipher mode
   0 - Exit
 EOF
 }
@@ -1144,7 +1294,7 @@ EOF
 while true; do
   banner
   show_menu
-  read -rp "Enter your choice [0-10]: " CHOICE || exit 0
+  read -rp "Enter your choice [0-12]: " CHOICE || exit 0
 
   case "$CHOICE" in
     1) ( action_iran ) ;;
@@ -1157,6 +1307,8 @@ while true; do
     8) ( action_remove_node ) ;;
     9) ( action_set_rotate ) ;;
     10) ( action_port_rotation ) ;;
+    11) ( action_light_guard ) ;;
+    12) ( action_udp2raw_mode ) ;;
     0|q|Q) echo "Bye."; exit 0 ;;
     *) warn "Invalid choice." ;;
   esac
