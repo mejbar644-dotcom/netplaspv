@@ -13,17 +13,20 @@ SVC="/etc/systemd/system/udp2raw.service"
 ROT_CONF="${CFG_DIR}/rotate.conf"
 ROT_BIN="/usr/local/bin/awg-port-rotate.sh"
 ROT_DEFAULT_POOL="8443,2053,2083,2087,2096"
+HELPERS_CHANGED=0
+NOTICE=""
 
-# تشخیص خودکار پورت SSH فعلی سرور برای جلوگیری از قطع شدن دسترسی
+# Auto-detect the current SSH port so it is never forwarded or blocked
 DETECTED_SSH=$(ss -tlpn 2>/dev/null | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
 KEEP_TCP_PORTS="${DETECTED_SSH:-22},80,443,10052"
 
-# ---------- رنگ‌ها و خروجی ----------
+# ---------- Colors & output ----------
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
   CYAN=$(tput setaf 6); YELLOW=$(tput setaf 3); GREEN=$(tput setaf 2)
   RED=$(tput setaf 1); BOLD=$(tput bold); RESET=$(tput sgr0)
+  DIM=$(tput dim 2>/dev/null || true)
 else
-  CYAN=""; YELLOW=""; GREEN=""; RED=""; BOLD=""; RESET=""
+  CYAN=""; YELLOW=""; GREEN=""; RED=""; BOLD=""; RESET=""; DIM=""
 fi
 info()  { echo "${CYAN}[*]${RESET} $*"; }
 ok()    { echo "${GREEN}[+]${RESET} $*"; }
@@ -34,11 +37,16 @@ die()   { err "$*"; exit 1; }
 banner() {
   clear 2>/dev/null || true
   echo "${CYAN}${BOLD}"
-  echo "=================================================================="
-  echo "   AmneziaWG + udp2raw (FakeTCP) Tunnel v6.7 [1-to-5 Multi-Iran]"
-  echo "   Random Ports | Watchdog | Nightly Rotate | Anti-SNI | 1-2 TB/d"
-  echo "=================================================================="
-  echo "${RESET}"
+  cat <<'ART'
+ _   _ _____ _____ ____  _        _    ____
+| \ | | ____|_   _|  _ \| |      / \  / ___|
+|  \| |  _|   | | | |_) | |     / _ \ \___ \
+| |\  | |___  | | |  __/| |___ / ___ \ ___) |
+|_| \_|_____| |_| |_|   |_____/_/   \_\____/
+ART
+  echo "${RESET}${BOLD}  AmneziaWG + udp2raw FakeTCP Tunnel  |  v6.9  |  Netplas Team${RESET}"
+  echo "${DIM}  Multi-Iran hub: 1 foreign server + up to 5 Iran nodes${RESET}"
+  echo
 }
 
 [[ $EUID -eq 0 ]] || die "Please run this script as root (sudo -i)."
@@ -46,7 +54,7 @@ banner() {
 exec 9>/var/lock/awg-tunnel.lock
 flock -n 9 || die "Another instance of this script is already running."
 
-# ---------- توابع کمکی ----------
+# ---------- Helpers ----------
 rnd() {
   local min=$1 max=$2 span=$(( $2 - $1 + 1 ))
   echo $(( min + ( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % span ) ))
@@ -76,6 +84,20 @@ confirm_yes() {
   local a
   read -rp "$1 [Y/n]: " a
   [[ "${a,,}" != "n" ]]
+}
+
+# Writes stdin to DEST only if it differs; returns 0 when the file changed
+sync_file() {
+  local dest=$1 mode=${2:-644} tmp
+  tmp=$(mktemp) || return 1
+  cat > "$tmp"
+  if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  install -m "$mode" "$tmp" "$dest"
+  rm -f "$tmp"
+  return 0
 }
 
 normalize_pool() {
@@ -110,12 +132,12 @@ filter_free_pool() {
   ( IFS=,; echo "${out[*]:-}" )
 }
 
-# شماره روز چرخش؛ ۱۰ ثانیه قبل از ۴:۳۰ تهران عوض می‌شود تا اجرای ساعت ۴:۳۰ همیشه روز جدید را ببیند
+# Rotation day number; it flips 10 seconds before 04:30 Tehran so the 04:30 run always sees the new day
 rot_day() {
   echo $(( ( $(date +%s) - 3590 ) / 86400 ))
 }
 
-# انتخاب پورت روز از روی استخر پورت و کلید مشترک
+# Pick the day's port from the pool and the shared secret
 rot_pick_port() {
   local pool=$1 secret=$2 off=${3:-0} arr n eday h0
   IFS=',' read -ra arr <<< "$pool"
@@ -216,7 +238,7 @@ apply_awg_live() {
   fi
 }
 
-# ---------- نصب پیش‌نیازها ----------
+# ---------- Prerequisites ----------
 detect_os() {
   . /etc/os-release 2>/dev/null || true
   OS_ID="${ID:-unknown}"
@@ -320,13 +342,9 @@ EOF
   fi
 }
 
-# ---------- تیونینگ کرنل، صف کارت شبکه و Conntrack ----------
-sysctl_tuning() {
-  info "Applying kernel, BBR, socket buffer, NIC queue & conntrack optimizations..."
-  modprobe nf_conntrack >/dev/null 2>&1 || true
-  modprobe tcp_bbr >/dev/null 2>&1 || true
-
-  cat > /etc/sysctl.d/99-awg-optimizer.conf <<'EOF'
+# ---------- Kernel, NIC queue & conntrack tuning ----------
+gen_sysctl_conf() {
+  cat <<'EOF'
 # IP Forwarding & RP Filter
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 2
@@ -375,6 +393,23 @@ net.netfilter.nf_conntrack_acct = 1
 # File Descriptors
 fs.file-max = 2097152
 EOF
+}
+
+gen_limits_conf() {
+  cat <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+}
+
+sysctl_tuning() {
+  info "Applying kernel, BBR, socket buffer, NIC queue & conntrack optimizations..."
+  modprobe nf_conntrack >/dev/null 2>&1 || true
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+
+  gen_sysctl_conf | sync_file /etc/sysctl.d/99-awg-optimizer.conf 644
 
   sysctl -q --system >/dev/null 2>&1 || true
 
@@ -387,16 +422,11 @@ EOF
     ip link set dev "$DEF_NIC" txqueuelen 10000 2>/dev/null || true
   fi
 
-  cat > /etc/security/limits.d/99-awg.conf <<'EOF'
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-EOF
+  gen_limits_conf | sync_file /etc/security/limits.d/99-awg.conf 644
   ok "Kernel, NIC queue (10000) & conntrack optimizations applied."
 }
 
-# ---------- پروفایل مبهم‌سازی و توکن ----------
+# ---------- Obfuscation profile & token ----------
 gen_profile() {
   JC=$(rnd 3 6)
   JMIN=$(rnd 40 80)
@@ -429,7 +459,7 @@ decode_token() {
   valid_port "$RAW_PORT" || die "Token has an invalid port."
 }
 
-# ---------- سرویس‌های udp2raw ----------
+# ---------- udp2raw services ----------
 setup_udp2raw_foreign() {
   systemctl stop udp2raw.service >/dev/null 2>&1 || true
   if ss -tlpn 2>/dev/null | grep -q ":${RAW_PORT} "; then
@@ -499,9 +529,9 @@ EOF
   fi
 }
 
-# ---------- واچ‌داگ و چرخش شبانه ----------
-write_watchdog_script() {
-  cat > /usr/local/bin/awg-watchdog.sh <<EOF
+# ---------- Watchdog & nightly rotation ----------
+gen_watchdog_script() {
+  cat <<EOF
 #!/usr/bin/env bash
 TARGET_IP="${FR_ADDR}"
 IFACE="${IFACE}"
@@ -523,14 +553,15 @@ fi
 logger -t awg-watchdog "Still down. Step 2: restarting awg-quick@\$IFACE..."
 systemctl restart "awg-quick@\${IFACE}.service"
 EOF
-  chmod +x /usr/local/bin/awg-watchdog.sh
 }
 
-setup_watchdog() {
-  info "Setting up watchdog (45s) & nightly session rotation..."
-  write_watchdog_script
+write_watchdog_script() {
+  gen_watchdog_script | sync_file /usr/local/bin/awg-watchdog.sh 755 && HELPERS_CHANGED=1
+  return 0
+}
 
-  cat > /etc/systemd/system/awg-watchdog.service <<'EOF'
+gen_watchdog_service() {
+  cat <<'EOF'
 [Unit]
 Description=AmneziaWG Self-Healing Watchdog Check
 After=network.target
@@ -539,8 +570,10 @@ After=network.target
 Type=oneshot
 ExecStart=/usr/local/bin/awg-watchdog.sh
 EOF
+}
 
-  cat > /etc/systemd/system/awg-watchdog.timer <<'EOF'
+gen_watchdog_timer() {
+  cat <<'EOF'
 [Unit]
 Description=Run AmneziaWG Watchdog every 45 seconds
 
@@ -552,14 +585,30 @@ AccuracySec=5
 [Install]
 WantedBy=timers.target
 EOF
+}
 
-  systemctl daemon-reload
+write_watchdog_units() {
+  local ch=0
+  gen_watchdog_service | sync_file /etc/systemd/system/awg-watchdog.service 644 && ch=1
+  gen_watchdog_timer | sync_file /etc/systemd/system/awg-watchdog.timer 644 && ch=1
+  if (( ch )); then
+    HELPERS_CHANGED=1
+    systemctl daemon-reload
+    systemctl enable awg-watchdog.timer >/dev/null 2>&1
+    systemctl restart awg-watchdog.timer >/dev/null 2>&1
+  fi
+  return 0
+}
+
+setup_watchdog() {
+  info "Setting up watchdog (45s) & nightly session rotation..."
+  write_watchdog_script
+  write_watchdog_units
   systemctl enable --now awg-watchdog.timer >/dev/null 2>&1
   ok "Watchdog (45s) enabled."
   write_rotate_timer "04:30"
 }
-
-write_rotate_script() {
+gen_rotate_script() {
   {
     cat <<'EOF'
 #!/usr/bin/env bash
@@ -610,7 +659,7 @@ fi
 
 CUR=$(cur_port)
 
-# امروز قبلاً انجام شده؛ فقط در حالت شبانه سشن تازه می‌شود
+# Today is already handled; only the nightly run refreshes the session
 if [[ "$APPLIED" == "$TODAY" ]]; then
   if [[ "$MODE" == "--nightly" ]]; then
     systemctl restart udp2raw.service
@@ -646,13 +695,43 @@ else
   echo "APPLIED=${TODAY}" >> "$CONF"
 fi
 EOF
-  } > "$ROT_BIN"
-  chmod +x "$ROT_BIN"
+  }
 }
 
-# چرخش شبانه بر اساس وقت تهران (UTC+3:30، بدون تغییر ساعت تابستانی)
+write_rotate_script() {
+  gen_rotate_script | sync_file "$ROT_BIN" 755 && HELPERS_CHANGED=1
+  return 0
+}
+
+gen_rotate_service() {
+  cat <<EOF
+[Unit]
+Description=Nightly FakeTCP Session / Port Rotation
+
+[Service]
+Type=oneshot
+ExecStart=${ROT_BIN} --nightly
+EOF
+}
+
+gen_rotate_timer() {
+  cat <<EOF
+[Unit]
+Description=Rotate FakeTCP Session Daily at ${1} Tehran time
+
+[Timer]
+OnCalendar=${2}
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Nightly rotation at Tehran time (UTC+3:30, no daylight saving)
 write_rotate_timer() {
-  local when="${1:-04:30}"
+  local when="${1:-04:30}" quiet="${2:-}"
   [[ "$when" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "Invalid time. Use HH:MM."
   write_rotate_script
   if [[ -f "$ROT_CONF" ]] && ! grep -q '^APPLIED=' "$ROT_CONF"; then
@@ -664,38 +743,26 @@ write_rotate_timer() {
     local h=${when%%:*} m=${when##*:}
     local total=$(( (10#$h * 60 + 10#$m - 210 + 1440) % 1440 ))
     cal=$(printf '*-*-* %02d:%02d:00 UTC' $(( total / 60 )) $(( total % 60 )))
-    warn "Timezone suffix unsupported by this systemd. Using UTC equivalent: ${cal}"
+    [[ -n "$quiet" ]] || warn "Timezone suffix unsupported by this systemd. Using UTC equivalent: ${cal}"
   fi
 
-  cat > /etc/systemd/system/awg-nightly-rotate.service <<EOF
-[Unit]
-Description=Nightly FakeTCP Session / Port Rotation
+  local ch=0
+  gen_rotate_service | sync_file /etc/systemd/system/awg-nightly-rotate.service 644 && ch=1
+  gen_rotate_timer "$when" "$cal" | sync_file /etc/systemd/system/awg-nightly-rotate.timer 644 && ch=1
 
-[Service]
-Type=oneshot
-ExecStart=${ROT_BIN} --nightly
-EOF
-
-  cat > /etc/systemd/system/awg-nightly-rotate.timer <<EOF
-[Unit]
-Description=Rotate FakeTCP Session Daily at ${when} Tehran time
-
-[Timer]
-OnCalendar=${cal}
-AccuracySec=1s
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable awg-nightly-rotate.timer >/dev/null 2>&1
-  systemctl restart awg-nightly-rotate.timer >/dev/null 2>&1
-  ok "Nightly rotation set for ${when} Tehran time."
+  if (( ch )); then
+    HELPERS_CHANGED=1
+    systemctl daemon-reload
+    systemctl enable awg-nightly-rotate.timer >/dev/null 2>&1
+    systemctl restart awg-nightly-rotate.timer >/dev/null 2>&1
+  elif [[ -z "$quiet" ]]; then
+    systemctl enable --now awg-nightly-rotate.timer >/dev/null 2>&1
+  fi
+  [[ -n "$quiet" ]] || ok "Nightly rotation set for ${when} Tehran time."
+  return 0
 }
 
-# ---------- ساخت فایل کانفیگ ----------
+# ---------- Config file generation ----------
 common_iface_block() {
   cat <<EOF
 [Interface]
@@ -755,14 +822,14 @@ PostUp = ip link set dev ${NIC} txqueuelen 10000 2>/dev/null || true
 PostUp = iptables -t nat -N AWG_DNAT 2>/dev/null || true
 PostUp = iptables -t nat -F AWG_DNAT
 
-# حفاظت از ارتباط سرور ایران با اینترنت، سرور خارج و DNS
+# Protect the Iran server's own traffic: foreign server, established flows and DNS
 PostUp = iptables -t nat -A AWG_DNAT -s ${FOREIGN_IP} -j RETURN
 PostUp = iptables -t nat -A AWG_DNAT -d ${FOREIGN_IP} -j RETURN
 PostUp = iptables -t nat -A AWG_DNAT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 PostUp = iptables -t nat -A AWG_DNAT -p udp --sport 53 -j RETURN
 PostUp = iptables -t nat -A AWG_DNAT -p tcp --sport 53 -j RETURN
 
-# قوانین فوروارد پورت
+# Port forwarding rules
 PostUp = iptables -t nat -C PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || iptables -t nat -I PREROUTING 1 -i ${NIC} -j AWG_DNAT
 ${DNAT_RULES}
 
@@ -772,7 +839,7 @@ PostUp = iptables -F AWG_GUARD
 PostUp = iptables -A AWG_GUARD -p tcp -m multiport --dports 25,465,587 -j DROP
 ${GUARD_RULES}PostUp = iptables -C FORWARD -i ${NIC} -o %i -j AWG_GUARD 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j AWG_GUARD
 
-# NAT و MSS Clamping
+# NAT & MSS clamping
 PostUp = iptables -t nat -C POSTROUTING -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
 PostUp = iptables -C FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${NIC} -o %i -j ACCEPT
 PostUp = iptables -C FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -o ${NIC} -j ACCEPT
@@ -830,21 +897,68 @@ EOF
   chmod 600 "$CFG"
 }
 
-bring_up() {
-  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
-  awg-quick down "$IFACE" >/dev/null 2>&1 || true
-  ip link del "$IFACE" >/dev/null 2>&1 || true
-  awg-quick up "$IFACE" || die "awg-quick failed to start ${IFACE}."
-  if [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]]; then
-    mkdir -p "/etc/systemd/system/awg-quick@${IFACE}.service.d"
-    cat > "/etc/systemd/system/awg-quick@${IFACE}.service.d/override.conf" <<'EOF'
+gen_awg_override() {
+  cat <<'EOF'
 [Service]
 EnvironmentFile=-/etc/default/amneziawg
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
 EOF
+}
+
+write_awg_override() {
+  [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]] || return 0
+  mkdir -p "/etc/systemd/system/awg-quick@${IFACE}.service.d"
+  if gen_awg_override | sync_file "/etc/systemd/system/awg-quick@${IFACE}.service.d/override.conf" 644; then
+    HELPERS_CHANGED=1
     systemctl daemon-reload
+  fi
+  return 0
+}
+
+# On every script start, installed helper files are synced with this script version
+auto_refresh_helpers() {
+  [[ -f "$SVC" && -f "$META" ]] || return 0
+  local role when timer=/etc/systemd/system/awg-nightly-rotate.timer
+  role=$(meta_get ROLE)
+  [[ "$role" == "iran" || "$role" == "foreign" ]] || return 0
+  HELPERS_CHANGED=0
+
+  if gen_sysctl_conf | sync_file /etc/sysctl.d/99-awg-optimizer.conf 644; then
+    HELPERS_CHANGED=1
+    sysctl -q --system >/dev/null 2>&1 || true
+  fi
+  gen_limits_conf | sync_file /etc/security/limits.d/99-awg.conf 644 && HELPERS_CHANGED=1
+  write_awg_override
+
+  if [[ "$role" == "iran" ]]; then
+    write_watchdog_script
+    write_watchdog_units
+  fi
+
+  if [[ "$role" == "iran" || -f "$ROT_CONF" ]]; then
+    when="04:30"
+    if grep -q 'Tehran' "$timer" 2>/dev/null; then
+      when=$(sed -n 's/.*Daily at \([0-9][0-9]:[0-9][0-9]\).*/\1/p' "$timer" | head -n1)
+    fi
+    [[ -n "$when" ]] || when="04:30"
+    write_rotate_timer "$when" quiet
+  fi
+
+  if (( HELPERS_CHANGED )); then
+    NOTICE="${GREEN}[+]${RESET} Helper files were updated to match this script version."
+  fi
+  return 0
+}
+
+bring_up() {
+  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
+  awg-quick down "$IFACE" >/dev/null 2>&1 || true
+  ip link del "$IFACE" >/dev/null 2>&1 || true
+  awg-quick up "$IFACE" || die "awg-quick failed to start ${IFACE}."
+  if [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]]; then
+    write_awg_override
     systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 && ok "AmneziaWG service enabled on boot."
   fi
   ok "Interface ${IFACE} is up (ListenPort: ${LISTEN_PORT})."
@@ -867,7 +981,7 @@ wait_handshake() {
   return 1
 }
 
-# ============================ عملیات منو ============================
+# ============================ Menu actions ============================
 action_foreign() {
   if [[ -f "$CFG" ]]; then
     warn "A config already exists. Continuing will regenerate all keys and the token, and every Iran node must be re-added."
@@ -1271,30 +1385,120 @@ action_uninstall() {
   ok "Uninstalled and cleaned up all services, rules and configs."
 }
 
-show_menu() {
-  cat <<EOF
-Select an option:
-  1 - IRAN server setup
-  2 - FOREIGN server setup
-  3 - FOREIGN: add / update Iran node key
-  4 - Health check & diagnostics
-  5 - Rotate FakeTCP port / session
-  6 - Uninstall
-  7 - FOREIGN: show master token
-  8 - FOREIGN: remove Iran node
-  9 - Set nightly rotation time
-  10 - Daily web-port rotation
-  11 - IRAN: lighter Anti-SNI rules
-  12 - udp2raw cipher mode
-  0 - Exit
-EOF
+hr() {
+  echo "${DIM}  ------------------------------------------------------------${RESET}"
 }
 
-# ============================ حلقه اصلی منو ============================
+status_panel() {
+  local role label tun u2r port rot pool_n hs now online=0 total=0 last=0 link
+  role=$(meta_get ROLE)
+  hr
+  if [[ -z "$role" ]]; then
+    echo "  Server  : ${YELLOW}not installed${RESET}"
+    hr
+    return 0
+  fi
+
+  if [[ "$role" == "iran" ]]; then
+    label="IRAN node #$(meta_get NODE_ID) ($(meta_get SELF_ADDR))"
+  else
+    label="FOREIGN hub (${FR_ADDR})"
+  fi
+
+  if ip link show "$IFACE" >/dev/null 2>&1; then tun="${GREEN}UP${RESET}"; else tun="${RED}DOWN${RESET}"; fi
+  if systemctl is-active --quiet udp2raw.service 2>/dev/null; then u2r="${GREEN}active${RESET}"; else u2r="${RED}down${RESET}"; fi
+  port=$(cur_port_from_service)
+
+  if [[ -f "$ROT_CONF" ]]; then
+    pool_n=$(sed -n 's/^POOL=//p' "$ROT_CONF" | head -n1 | tr ',' '\n' | grep -c .)
+    rot="${GREEN}ON${RESET} (${pool_n} ports)"
+  else
+    rot="${YELLOW}OFF${RESET}"
+  fi
+
+  now=$(date +%s)
+  if command -v awg >/dev/null 2>&1 && ip link show "$IFACE" >/dev/null 2>&1; then
+    while read -r _ hs; do
+      [[ "$hs" =~ ^[0-9]+$ ]] || continue
+      total=$(( total + 1 ))
+      if (( hs > 0 && now - hs < 180 )); then
+        online=$(( online + 1 ))
+        (( hs > last )) && last=$hs
+      fi
+    done < <(awg show "$IFACE" latest-handshakes 2>/dev/null)
+  fi
+
+  if [[ "$role" == "foreign" ]]; then
+    if (( total > 0 && online == total )); then
+      link="${GREEN}Iran nodes online ${online}/${total}${RESET}"
+    elif (( online == 0 )); then
+      link="${RED}Iran nodes online ${online}/${total}${RESET}"
+    else
+      link="${YELLOW}Iran nodes online ${online}/${total}${RESET}"
+    fi
+  elif (( online > 0 )); then
+    link="${GREEN}hub link OK${RESET} (handshake $(( now - last ))s ago)"
+  else
+    link="${RED}no recent handshake${RESET}"
+  fi
+
+  echo "  Server  : ${BOLD}${label}${RESET}"
+  echo "  Tunnel  : ${tun}   udp2raw: ${u2r}   ${link}"
+  echo "  FakeTCP : port ${port:-?}   rotation: ${rot}"
+  echo "  Time    : $(TZ=Asia/Tehran date '+%F %H:%M') Tehran"
+  hr
+}
+
+menu_section() {
+  echo
+  echo "  ${CYAN}${BOLD}$1${RESET}"
+}
+
+# Items that do not apply to this server's role are dimmed
+menu_item() {
+  local num=$1 label=$2 scope=${3:-both} pre="" post=""
+  if [[ -n "$MENU_ROLE" && "$scope" != "both" && "$scope" != "$MENU_ROLE" ]]; then
+    pre="$DIM"; post="$RESET"
+  fi
+  printf '    %s%-3s %s%s\n' "$pre" "$num" "$label" "$post"
+}
+
+show_menu() {
+  MENU_ROLE=$(meta_get ROLE)
+  menu_section "SETUP"
+  menu_item 1  "Iran server setup" iran
+  menu_item 2  "Foreign server setup" foreign
+  menu_section "FOREIGN SERVER"
+  menu_item 3  "Add / update Iran node key" foreign
+  menu_item 7  "Show master token" foreign
+  menu_item 8  "Remove Iran node" foreign
+  menu_section "IRAN SERVER"
+  menu_item 11 "Lighter Anti-SNI rules" iran
+  menu_section "BOTH SERVERS"
+  menu_item 4  "Health check & diagnostics" both
+  menu_item 5  "Change FakeTCP port / refresh session" both
+  menu_item 9  "Set nightly rotation time" both
+  menu_item 10 "Daily web-port rotation" both
+  menu_item 12 "udp2raw cipher mode" both
+  menu_section "SYSTEM"
+  menu_item 6  "Uninstall" both
+  menu_item 0  "Exit" both
+  echo
+}
+
+# ============================ Main menu loop ============================
+auto_refresh_helpers
+
 while true; do
   banner
+  status_panel
+  if [[ -n "$NOTICE" ]]; then
+    echo
+    echo "  $NOTICE"
+    NOTICE=""
+  fi
   show_menu
-  read -rp "Enter your choice [0-12]: " CHOICE || exit 0
+  read -rp "  Select an option [0-12]: " CHOICE || exit 0
 
   case "$CHOICE" in
     1) ( action_iran ) ;;
@@ -1310,7 +1514,8 @@ while true; do
     11) ( action_light_guard ) ;;
     12) ( action_udp2raw_mode ) ;;
     0|q|Q) echo "Bye."; exit 0 ;;
-    *) warn "Invalid choice." ;;
+    "") continue ;;
+    *) warn "Invalid choice. Enter a number from 0 to 12." ;;
   esac
 
   echo
