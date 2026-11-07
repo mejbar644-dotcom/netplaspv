@@ -1363,16 +1363,37 @@ action_udp2raw_mode() {
   ok "udp2raw mode set to ${nc} + ${na}. Repeat on every other server."
 }
 
+awg_firewall_pattern() {
+  echo "AWG_DNAT|AWG_GUARD|udp2raw|(-i|-o) ${IFACE}( |\$)"
+}
+
 action_uninstall() {
   confirm "Remove all tunnel services, rules and configs?" || { info "Cancelled."; return 0; }
-  local was_foreign=0 last_port=""
+  local was_foreign=0 last_port="" pat left=() item
+  pat=$(awg_firewall_pattern)
   grep -q ' -s ' "$SVC" 2>/dev/null && was_foreign=1
   last_port=$(cur_port_from_service)
+
+  info "Stopping timers and services..."
   systemctl disable --now awg-watchdog.timer awg-watchdog.service >/dev/null 2>&1 || true
   systemctl disable --now awg-nightly-rotate.timer awg-nightly-rotate.service >/dev/null 2>&1 || true
   systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
   systemctl disable --now udp2raw.service >/dev/null 2>&1 || true
+
+  info "Bringing the tunnel interface down..."
+  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
   awg-quick down "$IFACE" >/dev/null 2>&1 || true
+  ip link del "$IFACE" >/dev/null 2>&1 || true
+  pkill -f '/usr/local/bin/udp2raw' >/dev/null 2>&1 || true
+  pkill -x amneziawg-go >/dev/null 2>&1 || true
+  sleep 1
+
+  if iptables-save 2>/dev/null | grep -qE "$pat"; then
+    info "Removing leftover firewall rules..."
+    iptables-save 2>/dev/null | grep -vE "$pat" | iptables-restore 2>/dev/null \
+      || warn "Could not clean the firewall automatically."
+  fi
+
   rm -rf "$CFG_DIR" /etc/sysctl.d/99-awg-optimizer.conf /etc/modules-load.d/amneziawg.conf \
          /etc/systemd/system/udp2raw.service /etc/systemd/system/awg-watchdog.service \
          /etc/systemd/system/awg-watchdog.timer /usr/local/bin/awg-watchdog.sh \
@@ -1382,7 +1403,18 @@ action_uninstall() {
   if [[ $was_foreign -eq 1 && -n "$last_port" ]] && ! port_used_by_other "$last_port"; then
     close_ufw_tcp "$last_port"
   fi
-  ok "Uninstalled and cleaned up all services, rules and configs."
+
+  ip link show "$IFACE" >/dev/null 2>&1 && left+=("interface ${IFACE} still exists")
+  pgrep -f '/usr/local/bin/udp2raw' >/dev/null 2>&1 && left+=("udp2raw is still running")
+  pgrep -x amneziawg-go >/dev/null 2>&1 && left+=("amneziawg-go is still running")
+  iptables-save 2>/dev/null | grep -qE "$pat" && left+=("tunnel firewall rules are still present")
+
+  if (( ${#left[@]} == 0 )); then
+    ok "Verified: interface, processes and firewall rules are gone. Services and configs removed."
+  else
+    for item in "${left[@]}"; do err "$item"; done
+    warn "Some parts could not be removed. Reboot this server, or run option 6 again."
+  fi
 }
 
 hr() {
