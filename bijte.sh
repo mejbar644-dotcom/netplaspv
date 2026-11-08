@@ -981,6 +981,86 @@ wait_handshake() {
   return 1
 }
 
+# ---------- Traffic helpers ----------
+fmt_bytes() {
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B KB MB GB TB", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.2f %s", b, u[i]
+  }'
+}
+
+fmt_dur() {
+  local s=${1:-0}
+  printf '%dd %02dh %02dm' $(( s / 86400 )) $(( s % 86400 / 3600 )) $(( s % 3600 / 60 ))
+}
+
+sys_stat() {
+  local v
+  v=$(cat "/sys/class/net/$1/statistics/$2" 2>/dev/null)
+  [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0
+}
+
+mbps() {
+  awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", (b - a) * 8 / 2 / 1000000 }'
+}
+
+traffic_section() {
+  local role=$1 nic k r t ip label born up_s="" n=0
+  local tot_rx=0 tot_tx=0
+  local -A peer_ip=()
+
+  if ! ip link show "$IFACE" >/dev/null 2>&1; then
+    warn "Tunnel interface ${IFACE} is down; no traffic data."
+    return 0
+  fi
+  nic=$(meta_get NIC); [[ -n "$nic" ]] || nic=$(main_iface)
+
+  born=$(stat -c %Y "/sys/class/net/${IFACE}" 2>/dev/null)
+  if [[ "$born" =~ ^[0-9]+$ ]]; then
+    up_s=$(( $(date +%s) - born ))
+    echo "Counting since tunnel start: $(fmt_dur "$up_s") ago"
+  fi
+  echo "${DIM}(RX = received by this server, TX = sent by this server; counters reset on tunnel restart)${RESET}"
+  echo
+
+  while read -r k ip; do
+    [[ -n "$k" ]] && peer_ip[$k]=${ip%%/*}
+  done < <(awg show "$IFACE" allowed-ips 2>/dev/null)
+
+  printf '  %-30s %-16s %-16s\n' "Peer" "RX" "TX"
+  while read -r k r t; do
+    [[ "$r" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ ]] || continue
+    ip=${peer_ip[$k]:-?}
+    if [[ "$role" == "foreign" && "$ip" =~ ^10\.0\.0\.([0-9]+)$ ]]; then
+      label="Iran node #$(( BASH_REMATCH[1] - 1 )) (${ip})"
+    else
+      label="Foreign hub (${ip})"
+    fi
+    printf '  %-30s %-16s %-16s\n' "$label" "$(fmt_bytes "$r")" "$(fmt_bytes "$t")"
+    tot_rx=$(( tot_rx + r )); tot_tx=$(( tot_tx + t )); n=$(( n + 1 ))
+  done < <(awg show "$IFACE" transfer 2>/dev/null)
+
+  if (( n == 0 )); then
+    echo "  No peers found."
+  elif (( n > 1 )); then
+    printf '  %-30s %-16s %-16s\n' "TOTAL" "$(fmt_bytes "$tot_rx")" "$(fmt_bytes "$tot_tx")"
+  fi
+  echo "  Total through tunnel: $(fmt_bytes $(( tot_rx + tot_tx )))"
+
+  echo
+  local r1 t1 r2 t2
+  r1=$(sys_stat "$IFACE" rx_bytes); t1=$(sys_stat "$IFACE" tx_bytes)
+  sleep 2
+  r2=$(sys_stat "$IFACE" rx_bytes); t2=$(sys_stat "$IFACE" tx_bytes)
+  echo "  Live speed (2s sample): RX $(mbps "$r1" "$r2") Mbps | TX $(mbps "$t1" "$t2") Mbps"
+
+  if [[ -n "$nic" && -d "/sys/class/net/${nic}" ]]; then
+    echo "  Main NIC ${nic} since boot: RX $(fmt_bytes "$(sys_stat "$nic" rx_bytes)") | TX $(fmt_bytes "$(sys_stat "$nic" tx_bytes)")"
+    echo "  ${DIM}(NIC totals include all traffic, FakeTCP overhead and SSH; compare with the tunnel totals above)${RESET}"
+  fi
+}
+
 # ============================ Menu actions ============================
 action_foreign() {
   if [[ -f "$CFG" ]]; then
@@ -1104,7 +1184,7 @@ action_iran() {
 
   echo
   ok "Iran node #${NODE_ID} (${SELF_ADDR}) configured (AWG: ${LISTEN_PORT}, local UDP: ${LOCAL_UDP_PORT})."
-  echo "${YELLOW}${BOLD}Copy this node key and paste it on the foreign server in option 3:${RESET}"
+  echo "${YELLOW}${BOLD}Copy this node key and paste it on the foreign server in option 4:${RESET}"
   echo "${CYAN}${NODE_ID}:${IR_PUB}${RESET}"
   echo
 }
@@ -1174,7 +1254,7 @@ action_health() {
     pp=$(sed -n 's/^POOL=//p' "$ROT_CONF" | head -n1)
     IFS=',' read -ra parr <<< "$pp"
     for p in "${parr[@]}"; do
-      port_used_by_other "$p" && warn "Pool port ${p} is used by another service. Remove it from the pool on ALL servers (option 10)."
+      port_used_by_other "$p" && warn "Pool port ${p} is used by another service. Remove it from the pool on ALL servers (option 9)."
     done
   fi
   echo ""
@@ -1199,6 +1279,9 @@ action_health() {
   else
     ping -c 2 -W 1 "$FR_ADDR" >/dev/null 2>&1 && ok "Foreign hub (${FR_ADDR}) is REACHABLE." || warn "Foreign hub (${FR_ADDR}) not reachable."
   fi
+  echo ""
+  echo "${CYAN}${BOLD}=== 7. Tunnel Traffic ===${RESET}"
+  traffic_section "$role"
 }
 
 action_rotate() {
@@ -1369,8 +1452,13 @@ awg_firewall_pattern() {
 
 action_uninstall() {
   confirm "Remove all tunnel services, rules and configs?" || { info "Cancelled."; return 0; }
-  local was_foreign=0 last_port="" pat left=() item
+  local was_foreign=0 last_port="" pat left=() item rm_bins=0
   pat=$(awg_firewall_pattern)
+
+  if confirm "Also remove the installed binaries (udp2raw and amneziawg-go)?"; then
+    rm_bins=1
+  fi
+
   grep -q ' -s ' "$SVC" 2>/dev/null && was_foreign=1
   last_port=$(cur_port_from_service)
 
@@ -1399,6 +1487,15 @@ action_uninstall() {
          /etc/systemd/system/awg-watchdog.timer /usr/local/bin/awg-watchdog.sh \
          /etc/systemd/system/awg-nightly-rotate.service /etc/systemd/system/awg-nightly-rotate.timer \
          /etc/security/limits.d/99-awg.conf "/etc/systemd/system/awg-quick@${IFACE}.service.d" "$ROT_BIN"
+
+  if (( rm_bins )); then
+    rm -f /usr/local/bin/udp2raw /usr/local/bin/amneziawg-go /etc/default/amneziawg
+    ok "Binaries removed (udp2raw, amneziawg-go)."
+    info "The amneziawg / amneziawg-tools packages are kept; remove them with apt if you do not need them."
+  else
+    info "Binaries kept: /usr/local/bin/udp2raw and amneziawg-go (if installed)."
+  fi
+
   systemctl daemon-reload
   if [[ $was_foreign -eq 1 && -n "$last_port" ]] && ! port_used_by_other "$last_port"; then
     close_ufw_tcp "$last_port"
@@ -1413,7 +1510,7 @@ action_uninstall() {
     ok "Verified: interface, processes and firewall rules are gone. Services and configs removed."
   else
     for item in "${left[@]}"; do err "$item"; done
-    warn "Some parts could not be removed. Reboot this server, or run option 6 again."
+    warn "Some parts could not be removed. Reboot this server, or run option 12 again."
   fi
 }
 
@@ -1500,20 +1597,21 @@ show_menu() {
   menu_section "SETUP"
   menu_item 1  "Iran server setup" iran
   menu_item 2  "Foreign server setup" foreign
+  menu_section "MONITOR"
+  menu_item 3  "Health check & traffic stats" both
   menu_section "FOREIGN SERVER"
-  menu_item 3  "Add / update Iran node key" foreign
-  menu_item 7  "Show master token" foreign
-  menu_item 8  "Remove Iran node" foreign
+  menu_item 4  "Add / update Iran node key" foreign
+  menu_item 5  "Remove Iran node" foreign
+  menu_item 6  "Show master token" foreign
   menu_section "IRAN SERVER"
-  menu_item 11 "Lighter Anti-SNI rules" iran
+  menu_item 7  "Lighter Anti-SNI rules" iran
   menu_section "BOTH SERVERS"
-  menu_item 4  "Health check & diagnostics" both
-  menu_item 5  "Change FakeTCP port / refresh session" both
-  menu_item 9  "Set nightly rotation time" both
-  menu_item 10 "Daily web-port rotation" both
-  menu_item 12 "udp2raw cipher mode" both
+  menu_item 8  "Change FakeTCP port / refresh session" both
+  menu_item 9  "Daily web-port rotation" both
+  menu_item 10 "Set nightly rotation time" both
+  menu_item 11 "udp2raw cipher mode" both
   menu_section "SYSTEM"
-  menu_item 6  "Uninstall" both
+  menu_item 12 "Uninstall" both
   menu_item 0  "Exit" both
   echo
 }
@@ -1533,18 +1631,18 @@ while true; do
   read -rp "  Select an option [0-12]: " CHOICE || exit 0
 
   case "$CHOICE" in
-    1) ( action_iran ) ;;
-    2) ( action_foreign ) ;;
-    3) ( action_add_node ) ;;
-    4) ( action_health ) ;;
-    5) ( action_rotate ) ;;
-    6) ( action_uninstall ) ;;
-    7) ( action_show_token ) ;;
-    8) ( action_remove_node ) ;;
-    9) ( action_set_rotate ) ;;
-    10) ( action_port_rotation ) ;;
-    11) ( action_light_guard ) ;;
-    12) ( action_udp2raw_mode ) ;;
+    1)  ( action_iran ) ;;
+    2)  ( action_foreign ) ;;
+    3)  ( action_health ) ;;
+    4)  ( action_add_node ) ;;
+    5)  ( action_remove_node ) ;;
+    6)  ( action_show_token ) ;;
+    7)  ( action_light_guard ) ;;
+    8)  ( action_rotate ) ;;
+    9)  ( action_port_rotation ) ;;
+    10) ( action_set_rotate ) ;;
+    11) ( action_udp2raw_mode ) ;;
+    12) ( action_uninstall ) ;;
     0|q|Q) echo "Bye."; exit 0 ;;
     "") continue ;;
     *) warn "Invalid choice. Enter a number from 0 to 12." ;;
