@@ -13,6 +13,9 @@ SVC="/etc/systemd/system/udp2raw.service"
 ROT_CONF="${CFG_DIR}/rotate.conf"
 ROT_BIN="/usr/local/bin/awg-port-rotate.sh"
 ROT_DEFAULT_POOL="8443,2053,2083,2087,2096"
+NOTRACK_BIN="/usr/local/bin/u2r-notrack.sh"
+RPS_BIN="/usr/local/bin/awg-rps.sh"
+GUARD_RET='-p tcp -m connbytes --connbytes 11: --connbytes-mode packets --connbytes-dir original -j RETURN'
 HELPERS_CHANGED=0
 NOTICE=""
 
@@ -44,7 +47,7 @@ banner() {
 | |\  | |___  | | |  __/| |___ / ___ \ ___) |
 |_| \_|_____| |_| |_|   |_____/_/   \_\____/
 ART
-  echo "${RESET}${BOLD}  AmneziaWG + udp2raw FakeTCP Tunnel  |  v6.9  |  Netplas Team${RESET}"
+  echo "${RESET}${BOLD}  AmneziaWG + udp2raw FakeTCP Tunnel  |  v7.0  |  Netplas Team${RESET}"
   echo "${DIM}  Multi-Iran hub: 1 foreign server + up to 5 Iran nodes${RESET}"
   echo
 }
@@ -367,6 +370,9 @@ net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 
+# RPS flow table (used by awg-rps.service to spread softirq over all CPUs)
+net.core.rps_sock_flow_entries = 32768
+
 # TCP FastOpen, Keepalive & MTU Probing
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
@@ -404,6 +410,63 @@ root hard nofile 1048576
 EOF
 }
 
+# ---------- RPS (spread network softirq over all CPUs) ----------
+gen_rps_script() {
+  cat <<'EOF'
+#!/usr/bin/env bash
+# Spread RX softirq work of a single-queue NIC across all CPUs (RPS).
+NIC=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+[[ -n "$NIC" && -d "/sys/class/net/$NIC/queues" ]] || exit 0
+N=$(nproc)
+(( N > 1 )) || exit 0
+(( N > 32 )) && N=32
+Q=$(ls -d /sys/class/net/$NIC/queues/rx-* 2>/dev/null | wc -l)
+(( Q > 0 )) || exit 0
+# A multi-queue NIC already spreads load in hardware; RPS would only add overhead
+(( Q >= N )) && exit 0
+MASK=$(printf '%x' $(( (1 << N) - 1 )))
+CNT=$(( 32768 / Q ))
+sysctl -qw net.core.rps_sock_flow_entries=32768 2>/dev/null || true
+for q in /sys/class/net/$NIC/queues/rx-*; do
+  echo "$MASK" > "$q/rps_cpus" 2>/dev/null || true
+  echo "$CNT" > "$q/rps_flow_cnt" 2>/dev/null || true
+done
+exit 0
+EOF
+}
+
+gen_rps_service() {
+  cat <<EOF
+[Unit]
+Description=RPS softirq spreading for the AWG tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${RPS_BIN}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+ensure_rps() {
+  local ch=0
+  gen_rps_script | sync_file "$RPS_BIN" 755 && ch=1
+  gen_rps_service | sync_file /etc/systemd/system/awg-rps.service 644 && ch=1
+  if (( ch )); then
+    HELPERS_CHANGED=1
+    systemctl daemon-reload
+    systemctl enable awg-rps.service >/dev/null 2>&1
+    systemctl restart awg-rps.service >/dev/null 2>&1
+  else
+    systemctl enable --now awg-rps.service >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 sysctl_tuning() {
   info "Applying kernel, BBR, socket buffer, NIC queue & conntrack optimizations..."
   modprobe nf_conntrack >/dev/null 2>&1 || true
@@ -423,7 +486,8 @@ sysctl_tuning() {
   fi
 
   gen_limits_conf | sync_file /etc/security/limits.d/99-awg.conf 644
-  ok "Kernel, NIC queue (10000) & conntrack optimizations applied."
+  ensure_rps
+  ok "Kernel, NIC queue (10000), RPS & conntrack optimizations applied."
 }
 
 # ---------- Obfuscation profile & token ----------
@@ -459,6 +523,95 @@ decode_token() {
   valid_port "$RAW_PORT" || die "Token has an invalid port."
 }
 
+# ---------- FakeTCP notrack (keeps the outer FakeTCP packets out of conntrack) ----------
+gen_notrack_script() {
+  cat <<'EOF'
+#!/usr/bin/env bash
+# Adds/removes raw-table NOTRACK rules for the udp2raw FakeTCP port.
+# The port is read from the udp2raw unit, so it follows daily port rotation.
+SVC="/etc/systemd/system/udp2raw.service"
+ST="/run/u2r-notrack.rules"
+
+rules_for() {
+  if grep -q ' -s ' "$SVC"; then
+    local p
+    p=$(grep -oE -- '-l 0\.0\.0\.0:[0-9]+' "$SVC" | grep -oE '[0-9]+$')
+    [[ -n "$p" ]] || return 1
+    echo "PREROUTING -p tcp --dport $p"
+    echo "OUTPUT -p tcp --sport $p"
+  else
+    local r ip p
+    r=$(grep -oE -- '-r [0-9.]+:[0-9]+' "$SVC" | awk '{print $2}')
+    [[ -n "$r" ]] || return 1
+    ip=${r%:*}; p=${r#*:}
+    echo "PREROUTING -p tcp -s $ip --sport $p"
+    echo "OUTPUT -p tcp -d $ip --dport $p"
+  fi
+}
+
+del() {
+  [[ -f "$ST" ]] || return 0
+  while read -r l; do
+    [[ -n "$l" ]] && iptables -t raw -D $l -j CT --notrack 2>/dev/null
+  done < "$ST"
+  rm -f "$ST"
+  return 0
+}
+
+add() {
+  del
+  rules_for > "$ST" || { rm -f "$ST"; return 0; }
+  while read -r l; do
+    [[ -n "$l" ]] || continue
+    iptables -t raw -C $l -j CT --notrack 2>/dev/null || iptables -t raw -A $l -j CT --notrack 2>/dev/null
+  done < "$ST"
+  return 0
+}
+
+case "${1:-}" in
+  add) add ;;
+  del) del ;;
+esac
+exit 0
+EOF
+}
+
+write_notrack_helper() {
+  gen_notrack_script | sync_file "$NOTRACK_BIN" 755 && HELPERS_CHANGED=1
+  return 0
+}
+
+# Adds the hooks to an existing udp2raw unit (installs made by older script versions)
+ensure_notrack_in_service() {
+  write_notrack_helper
+  [[ -f "$SVC" ]] || return 0
+  if ! grep -q 'u2r-notrack' "$SVC"; then
+    sed -i "/^ExecStart=/i ExecStartPre=-${NOTRACK_BIN} add" "$SVC"
+    sed -i "/^Restart=always/i ExecStopPost=-${NOTRACK_BIN} del" "$SVC"
+    HELPERS_CHANGED=1
+    systemctl daemon-reload
+  fi
+  # Applies instantly without restarting the tunnel
+  "$NOTRACK_BIN" add
+  return 0
+}
+
+# ---------- Anti-SNI guard: skip the string scan after the first 10 packets ----------
+migrate_guard_rule() {
+  [[ "$(meta_get ROLE)" == "iran" && -f "$CFG" ]] || return 0
+  grep -q 'connbytes' "$CFG" || return 0
+  if ! grep -q 'connbytes 11:' "$CFG"; then
+    cp -a "$CFG" "${CFG}.bak"
+    sed -i "/AWG_GUARD -p tcp -m multiport --dports 25,465,587 -j DROP/a PostUp = iptables -A AWG_GUARD ${GUARD_RET} 2>/dev/null || true" "$CFG"
+    grep -q 'connbytes 11:' "$CFG" && HELPERS_CHANGED=1
+  fi
+  if iptables -n -L AWG_GUARD >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    iptables -C AWG_GUARD $GUARD_RET 2>/dev/null || iptables -I AWG_GUARD 2 $GUARD_RET 2>/dev/null || true
+  fi
+  return 0
+}
+
 # ---------- udp2raw services ----------
 setup_udp2raw_foreign() {
   systemctl stop udp2raw.service >/dev/null 2>&1 || true
@@ -472,6 +625,7 @@ setup_udp2raw_foreign() {
     fi
   fi
 
+  write_notrack_helper
   cat > /etc/systemd/system/udp2raw.service <<EOF
 [Unit]
 Description=udp2raw FakeTCP Server (Foreign Multi-Iran Hub)
@@ -482,7 +636,9 @@ Wants=network-online.target
 Type=simple
 User=root
 LimitNOFILE=1048576
+ExecStartPre=-${NOTRACK_BIN} add
 ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${RAW_PORT} -r 127.0.0.1:${AWG_PORT} -k "${RAW_PASS}" --raw-mode faketcp -a --keep-rule --fix-gro --cipher-mode aes128cbc --auth-mode hmac_sha1 --seq-mode 4 --log-level 1
+ExecStopPost=-${NOTRACK_BIN} del
 Restart=always
 RestartSec=2
 
@@ -502,6 +658,7 @@ EOF
 
 setup_udp2raw_iran() {
   systemctl stop udp2raw.service >/dev/null 2>&1 || true
+  write_notrack_helper
   cat > /etc/systemd/system/udp2raw.service <<EOF
 [Unit]
 Description=udp2raw FakeTCP Client (Iran Node #${NODE_ID})
@@ -512,7 +669,9 @@ Wants=network-online.target
 Type=simple
 User=root
 LimitNOFILE=1048576
+ExecStartPre=-${NOTRACK_BIN} add
 ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${LOCAL_UDP_PORT} -r ${FOREIGN_IP}:${RAW_PORT} -k "${RAW_PASS}" --raw-mode faketcp -a --keep-rule --fix-gro --cipher-mode aes128cbc --auth-mode hmac_sha1 --seq-mode 4 --log-level 1
+ExecStopPost=-${NOTRACK_BIN} del
 Restart=always
 RestartSec=2
 
@@ -833,10 +992,11 @@ PostUp = iptables -t nat -A AWG_DNAT -p tcp --sport 53 -j RETURN
 PostUp = iptables -t nat -C PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || iptables -t nat -I PREROUTING 1 -i ${NIC} -j AWG_DNAT
 ${DNAT_RULES}
 
-# Anti-Bad-SNI & Anti-Abuse
+# Anti-Bad-SNI & Anti-Abuse (strings are scanned only in the first 10 packets of a connection)
 PostUp = iptables -N AWG_GUARD 2>/dev/null || true
 PostUp = iptables -F AWG_GUARD
 PostUp = iptables -A AWG_GUARD -p tcp -m multiport --dports 25,465,587 -j DROP
+PostUp = iptables -A AWG_GUARD ${GUARD_RET} 2>/dev/null || true
 ${GUARD_RULES}PostUp = iptables -C FORWARD -i ${NIC} -o %i -j AWG_GUARD 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j AWG_GUARD
 
 # NAT & MSS clamping
@@ -932,6 +1092,11 @@ auto_refresh_helpers() {
   gen_limits_conf | sync_file /etc/security/limits.d/99-awg.conf 644 && HELPERS_CHANGED=1
   write_awg_override
 
+  # CPU optimizations: RPS, FakeTCP notrack, lighter Anti-SNI guard
+  ensure_rps
+  ensure_notrack_in_service
+  migrate_guard_rule
+
   if [[ "$role" == "iran" ]]; then
     write_watchdog_script
     write_watchdog_units
@@ -947,7 +1112,7 @@ auto_refresh_helpers() {
   fi
 
   if (( HELPERS_CHANGED )); then
-    NOTICE="${GREEN}[+]${RESET} Helper files were updated to match this script version."
+    NOTICE="${GREEN}[+]${RESET} Helper files and CPU optimizations were updated to match this script version."
   fi
   return 0
 }
@@ -1262,6 +1427,11 @@ action_health() {
   CT_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "N/A")
   CT_MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "N/A")
   echo "Active connections: ${CT_COUNT} / Max: ${CT_MAX}"
+  if iptables -t raw -S 2>/dev/null | grep -q 'notrack'; then
+    ok "FakeTCP notrack rules are ACTIVE (outer FakeTCP packets skip conntrack)."
+  else
+    warn "FakeTCP notrack rules are not active."
+  fi
   echo ""
   echo "${CYAN}${BOLD}=== 5. Anti-Bad-SNI Guard ===${RESET}"
   iptables -L AWG_GUARD -v -n 2>/dev/null || echo "Guard chain not active on this server."
@@ -1399,6 +1569,7 @@ action_light_guard() {
   [[ "$(meta_get ROLE)" == "iran" ]] || die "This option must be run on an Iran server."
   [[ -f "$CFG" ]] || die "No config at ${CFG}."
   if grep -q 'connbytes' "$CFG"; then
+    migrate_guard_rule
     info "Lighter Anti-SNI rules are already applied."
     return 0
   fi
@@ -1408,6 +1579,7 @@ action_light_guard() {
 
   cp -a "$CFG" "${CFG}.bak"
   sed -i -E 's#^PostUp = iptables -A AWG_GUARD -m string (.*) -j DROP$#PostUp = iptables -A AWG_GUARD -p tcp -m connbytes --connbytes 1:10 --connbytes-mode packets --connbytes-dir original -m string \1 -j DROP 2>/dev/null || iptables -A AWG_GUARD -m string \1 -j DROP#' "$CFG"
+  migrate_guard_rule
 
   grep -q 'nf_conntrack_acct' /etc/sysctl.d/99-awg-optimizer.conf 2>/dev/null \
     || echo "net.netfilter.nf_conntrack_acct = 1" >> /etc/sysctl.d/99-awg-optimizer.conf
@@ -1452,7 +1624,7 @@ awg_firewall_pattern() {
 
 action_uninstall() {
   confirm "Remove all tunnel services, rules and configs?" || { info "Cancelled."; return 0; }
-  local was_foreign=0 last_port="" pat left=() item rm_bins=0
+  local was_foreign=0 last_port="" pat left=() item rm_bins=0 q
   pat=$(awg_firewall_pattern)
 
   if confirm "Also remove the installed binaries (udp2raw and amneziawg-go)?"; then
@@ -1467,6 +1639,7 @@ action_uninstall() {
   systemctl disable --now awg-nightly-rotate.timer awg-nightly-rotate.service >/dev/null 2>&1 || true
   systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
   systemctl disable --now udp2raw.service >/dev/null 2>&1 || true
+  systemctl disable --now awg-rps.service >/dev/null 2>&1 || true
 
   info "Bringing the tunnel interface down..."
   set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
@@ -1474,6 +1647,7 @@ action_uninstall() {
   ip link del "$IFACE" >/dev/null 2>&1 || true
   pkill -f '/usr/local/bin/udp2raw' >/dev/null 2>&1 || true
   pkill -x amneziawg-go >/dev/null 2>&1 || true
+  [[ -x "$NOTRACK_BIN" ]] && "$NOTRACK_BIN" del >/dev/null 2>&1
   sleep 1
 
   if iptables-save 2>/dev/null | grep -qE "$pat"; then
@@ -1482,10 +1656,16 @@ action_uninstall() {
       || warn "Could not clean the firewall automatically."
   fi
 
+  # Revert RPS settings
+  for q in /sys/class/net/"$(main_iface)"/queues/rx-*/rps_cpus; do
+    [[ -w "$q" ]] && echo 0 > "$q" 2>/dev/null
+  done
+
   rm -rf "$CFG_DIR" /etc/sysctl.d/99-awg-optimizer.conf /etc/modules-load.d/amneziawg.conf \
          /etc/systemd/system/udp2raw.service /etc/systemd/system/awg-watchdog.service \
          /etc/systemd/system/awg-watchdog.timer /usr/local/bin/awg-watchdog.sh \
          /etc/systemd/system/awg-nightly-rotate.service /etc/systemd/system/awg-nightly-rotate.timer \
+         /etc/systemd/system/awg-rps.service "$RPS_BIN" "$NOTRACK_BIN" /run/u2r-notrack.rules \
          /etc/security/limits.d/99-awg.conf "/etc/systemd/system/awg-quick@${IFACE}.service.d" "$ROT_BIN"
 
   if (( rm_bins )); then
@@ -1505,6 +1685,7 @@ action_uninstall() {
   pgrep -f '/usr/local/bin/udp2raw' >/dev/null 2>&1 && left+=("udp2raw is still running")
   pgrep -x amneziawg-go >/dev/null 2>&1 && left+=("amneziawg-go is still running")
   iptables-save 2>/dev/null | grep -qE "$pat" && left+=("tunnel firewall rules are still present")
+  iptables -t raw -S 2>/dev/null | grep -q 'notrack' && left+=("notrack rules are still present")
 
   if (( ${#left[@]} == 0 )); then
     ok "Verified: interface, processes and firewall rules are gone. Services and configs removed."
@@ -1519,7 +1700,7 @@ hr() {
 }
 
 status_panel() {
-  local role label tun u2r port rot pool_n hs now online=0 total=0 last=0 link
+  local role label tun u2r port rot pool_n hs now online=0 total=0 last=0 link nt rp
   role=$(meta_get ROLE)
   hr
   if [[ -z "$role" ]]; then
@@ -1544,6 +1725,10 @@ status_panel() {
   else
     rot="${YELLOW}OFF${RESET}"
   fi
+
+  nt="${YELLOW}off${RESET}"; rp="${YELLOW}off${RESET}"
+  iptables -t raw -S 2>/dev/null | grep -q 'notrack' && nt="${GREEN}on${RESET}"
+  systemctl is-active --quiet awg-rps.service 2>/dev/null && rp="${GREEN}on${RESET}"
 
   now=$(date +%s)
   if command -v awg >/dev/null 2>&1 && ip link show "$IFACE" >/dev/null 2>&1; then
@@ -1574,6 +1759,7 @@ status_panel() {
   echo "  Server  : ${BOLD}${label}${RESET}"
   echo "  Tunnel  : ${tun}   udp2raw: ${u2r}   ${link}"
   echo "  FakeTCP : port ${port:-?}   rotation: ${rot}"
+  echo "  Perf    : notrack ${nt}   RPS ${rp}"
   echo "  Time    : $(TZ=Asia/Tehran date '+%F %H:%M') Tehran"
   hr
 }
